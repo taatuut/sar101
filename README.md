@@ -203,6 +203,9 @@ This highlights areas with strong backscatter increase or decrease between acqui
 
 Tip: apply transparency and add an XYZ basemap (OpenStreetMap) for context.
 
+![QGIS project Nijmegen](docs/images/qgis.png)
+
+
 ---
 
 ## B) Public free online viewer (geojson.io)

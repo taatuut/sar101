@@ -15,9 +15,9 @@ else
   echo "Directory $LOG_DIR does not exist."
 fi
 
-# Remove *.tif, *.png, *.gpkg from ./outputs
+# Remove *.tif, *.png, *.gpkg, *.xml from ./outputs
 if [ -d "$OUT_DIR" ]; then
-  find "$OUT_DIR" -type f \( -name "*.tif" -o -name "*.png" -o -name "*.gpkg" \) -print -delete
+  find "$OUT_DIR" -type f \( -name "*.tif" -o -name "*.png" -o -name "*.gpkg"  -o -name "*.xml" \) -print -delete
 else
   echo "Directory $OUT_DIR does not exist."
 fi
