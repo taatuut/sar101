@@ -1,0 +1,31 @@
+@startuml
+title sar101 - STAC-native SAR mini-lab (Component/Deployment view)
+
+actor "Analyst/Developer" as User
+
+node "macOS / Linux" as Host {
+  component "sar101.py\n(rasterio + numpy)" as App
+  component "pystac-client" as Stac
+  component "planetary-computer\n(signing)" as PC
+  database "outputs/\nGeoTIFF + GeoPackage" as Out
+}
+
+cloud "STAC API\nMicrosoft Planetary Computer" as STAC_API
+cloud "COG Assets\nSentinel-1 RTC" as COGs
+
+node "Docker" as Docker {
+  component "GeoServer" as GS
+  database "PostGIS" as PG
+}
+
+User --> App : run CLI flags\n(--bbox, --days, ...)
+App --> Stac : STAC search\n(collection, bbox, datetime)
+Stac --> STAC_API : /search
+App --> PC : sign item asset URLs
+PC --> COGs : returns signed COG href
+App --> COGs : HTTP range reads\n(/vsicurl/)
+App --> Out : write rasters + polygons\n(two GPKGs)
+Out --> PG : ogr2ogr import (optional)
+GS --> PG : publish WMS/WFS (optional)
+User --> GS : view layers\n(WMS/WFS/Preview)
+@enduml

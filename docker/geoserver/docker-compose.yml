@@ -1,0 +1,31 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: sar101-postgis
+    environment:
+      POSTGRES_DB: gis
+      POSTGRES_USER: gis
+      POSTGRES_PASSWORD: gis
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+
+  geoserver:
+    image: kartoza/geoserver:2.25.2
+    container_name: sar101-geoserver
+    depends_on:
+      - postgis
+    environment:
+      GEOSERVER_ADMIN_USER: admin
+      GEOSERVER_ADMIN_PASSWORD: geoserver
+      # Enables CORS for browser-based layer previewing in many setups
+      ENABLE_CORS: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - geoserver_data:/opt/geoserver/data_dir
+
+volumes:
+  postgis_data:
+  geoserver_data:

@@ -1,0 +1,9 @@
+name: sar101
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - gdal>=3.6
+  - numpy
+  - matplotlib
+  - pip
