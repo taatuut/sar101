@@ -173,5 +173,5 @@ cython_debug/
 # Custom cc
 **/.DS_Store
 **/Thumbs.db
-sar101.zip
+*.zip
 outputs/**
