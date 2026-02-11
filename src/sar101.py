@@ -37,6 +37,17 @@ from fiona.crs import to_string as crs_to_string
 
 from pystac_client import Client
 import planetary_computer as pc
+import logging
+from logging.handlers import RotatingFileHandler
+import inspect
+import json
+from pathlib import Path #as _Path
+import socket
+import getpass
+import time
+
+import uuid
+from audit_log.log import log as audit_log
 
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
@@ -45,6 +56,146 @@ STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 # Breda AOI (lon/lat bbox): [minLon, minLat, maxLon, maxLat]
 DEFAULT_BBOX_BREDA = [4.70, 51.53, 4.90, 51.66]
 
+
+
+
+def repo_root() -> Path:
+    """Repo root assumed to be the parent of the `src/` directory."""
+    return Path(__file__).resolve().parents[1]
+
+
+def cleanup_old_logs(logs_dir: Path, max_days: int = 7) -> None:
+    """Delete audit log files older than max_days. Best-effort (never breaks pipeline)."""
+    cutoff = time.time() - (max_days * 24 * 60 * 60)
+    for p in logs_dir.glob("sar101-audit.log*"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except Exception:
+            pass
+
+
+def setup_file_logging() -> Path:
+    """
+    Configure local file logging under ./logs with:
+    - size-based rotation at 10 MB
+    - retention cleanup older than 7 days
+    """
+    logs_dir = repo_root() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = logs_dir / "sar101-audit.log"
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Avoid duplicate handlers on repeated runs (e.g., notebooks)
+    if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith(str(log_path))
+               for h in root_logger.handlers):
+        handler = RotatingFileHandler(
+            filename=str(log_path),
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=20,             # adjust if needed
+            encoding="utf-8",
+        )
+        formatter = logging.Formatter(
+            fmt="%(asctime)sZ %(levelname)s %(name)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+
+    cleanup_old_logs(logs_dir, max_days=7)
+    return log_path
+
+
+def audit(event: str, **fields) -> None:
+    """
+    Write an audit event to:
+      1) local rotating file log (JSON line)
+      2) ICEYE audit_log.log.log()
+
+    The ICEYE library currently requires:
+      action, resource_type, resource_id, result, principal
+    (see TypeError in logs if omitted).
+
+    This wrapper guarantees those fields and never breaks the SAR pipeline
+    if the audit library call fails.
+    """
+    # Local JSON line (always)
+    payload = {"event": event, **fields}
+    logging.getLogger("sar101.audit").info(json.dumps(payload, default=str))
+
+    # Required fields for iceye-audit-log
+    principal = fields.get("principal") or getpass.getuser()
+    resource_type = fields.get("resource_type") or "sar101"
+    resource_id = (
+        fields.get("resource_id")
+        or fields.get("run_id")
+        or fields.get("t1_id")
+        or fields.get("item_id")
+        or event
+    )
+    result = fields.get("result")
+    if result is None:
+        result = "FAILURE" if event in ("run_failed",) or event.endswith("_failed") else "SUCCESS"
+
+    # Optional details/context for audit systems that support it
+    details = dict(fields)
+    details.setdefault("event", event)
+
+    try:
+        # Prefer keyword call (clear), fall back to positional if needed.
+        try:
+            audit_log(
+                action=event,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                result=result,
+                principal=principal,
+                details=details,
+            )
+        except TypeError:
+            # Some versions may not accept 'details' or keyword 'action'
+            try:
+                audit_log(
+                    action=event,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    result=result,
+                    principal=principal,
+                )
+            except TypeError:
+                # Positional fallback: (action, resource_type, resource_id, result, principal)
+                audit_log(event, resource_type, resource_id, result, principal)
+    except Exception:
+        logging.getLogger("sar101.audit").exception("iceye-audit-log call failed")
+
+
+    # Call iceye-audit-log best-effort without ever breaking the pipeline
+    try:
+        sig = inspect.signature(audit_log)
+        params = sig.parameters
+
+        # If it supports **kwargs, pass everything
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            audit_log(event=event, **fields)
+            return
+
+        allowed = {k: v for k, v in fields.items() if k in params}
+        if "event" in params:
+            allowed["event"] = event
+
+        positional = [
+            p for p in params.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        if positional and "event" not in params and positional[0].name not in allowed:
+            audit_log(event, **allowed)  # type: ignore
+        else:
+            audit_log(**allowed)         # type: ignore
+    except Exception:
+        logging.getLogger("sar101.audit").exception("iceye-audit-log call failed")
 
 @dataclass
 class Scene:
@@ -98,7 +249,7 @@ def stac_search_two_most_recent(
         datetime=f"{start.isoformat()}/{end.isoformat()}",
         limit=limit,
     )
-    items = list(search.get_items())
+    items = list(search.items())
     if len(items) < 2:
         raise RuntimeError(
             f"Need at least 2 scenes, found {len(items)}. Try increasing --days or expanding --bbox."
@@ -257,95 +408,157 @@ def polygonize_mask_to_gpkg(
 
 
 def main() -> None:
-    args = parse_args()
-    ensure_outdir(args.outdir)
+    try:
+        args = parse_args()
 
-    bbox = list(args.bbox)
+        log_path = setup_file_logging()
 
-    print(f"AOI bbox (lon/lat): {bbox}")
-    print(f"Searching STAC collection '{args.collection}' last {args.days} days (limit {args.limit}) ...")
+        run_id = str(uuid.uuid4())
+        audit("run_started", run_id=run_id, user=getpass.getuser(),
+            host=socket.gethostname(),
+            outdir=args.outdir,
+            bbox=list(args.bbox),
+            days=args.days,
+            limit=args.limit,
+            collection=args.collection,
+            prefer_polarization=args.prefer_polarization,
+            window_size=args.window_size,
+            water_thr_db=args.water_thr_db,
+            change_thr_db=args.change_thr_db,
+            audit_log_file=str(log_path),
+        )
 
-    t0, t1 = stac_search_two_most_recent(
-        bbox=bbox,
-        days=args.days,
-        limit=args.limit,
-        collection=args.collection,
-        prefer_pol=args.prefer_polarization,
-    )
+        ensure_outdir(args.outdir)
 
-    print("\nSelected scenes:")
-    print(f"  t0 (older): {t0.item_id}  {t0.dt.isoformat()}  asset={t0.asset_key}")
-    print(f"  t1 (newer): {t1.item_id}  {t1.dt.isoformat()}  asset={t1.asset_key}")
+        bbox = list(args.bbox)
 
-    # Open both scenes streaming
-    with open_streaming_raster(t0.href) as ds0, open_streaming_raster(t1.href) as ds1:
-        # If CRSs differ (rare for RTC), we bail for simplicity
-        if ds0.crs != ds1.crs:
-            raise RuntimeError(f"CRS mismatch: t0={ds0.crs} t1={ds1.crs}. Use a preprocessing step to align.")
-        crs = ds0.crs
+        print(f"AOI bbox (lon/lat): {bbox}")
+        print(f"Searching STAC collection '{args.collection}' last {args.days} days (limit {args.limit}) ...")
 
-        # Read same-size center window from each
-        arr0, transform0 = read_center_window(ds0, args.window_size)
-        arr1, transform1 = read_center_window(ds1, args.window_size)
+        t0, t1 = stac_search_two_most_recent(
+            bbox=bbox,
+            days=args.days,
+            limit=args.limit,
+            collection=args.collection,
+            prefer_pol=args.prefer_polarization,
+        )
 
-        # For simplicity, require same transform (center windows may differ slightly if raster dims differ)
-        # If transforms differ, we still proceed using t1 transform for outputs, assuming same pixel grid
-        transform = transform1
+        print("\nSelected scenes:")
+        print(f"  t0 (older): {t0.item_id}  {t0.dt.isoformat()}  asset={t0.asset_key}")
+        print(f"  t1 (newer): {t1.item_id}  {t1.dt.isoformat()}  asset={t1.asset_key}")
 
-    # Convert to dB
-    db0 = to_db(arr0)
-    db1 = to_db(arr1)
+        audit("open_streaming_rasters", run_id=run_id, t0_href=t0.href, t1_href=t1.href)
 
-    # Change detection ratio in dB (equivalent to 10log10(arr1/arr0))
-    ratio_db = db1 - db0
+        # Open both scenes streaming
+        with open_streaming_raster(t0.href) as ds0, open_streaming_raster(t1.href) as ds1:
+            # If CRSs differ (rare for RTC), we bail for simplicity
+            if ds0.crs != ds1.crs:
+                raise RuntimeError(f"CRS mismatch: t0={ds0.crs} t1={ds1.crs}. Use a preprocessing step to align.")
+            crs = ds0.crs
 
-    # Masks
-    water_mask_t1 = (db1 < args.water_thr_db).astype("uint8")
-    change_mask = (np.abs(ratio_db) > args.change_thr_db).astype("uint8")
+            # Read same-size center window from each
+            arr0, transform0 = read_center_window(ds0, args.window_size)
+            arr1, transform1 = read_center_window(ds1, args.window_size)
 
-    # Output paths
-    out_db1_png = os.path.join(args.outdir, "quicklook_t1_backscatter_db.png")
-    out_ratio_png = os.path.join(args.outdir, "quicklook_ratio_db_t1_minus_t0.png")
+            audit(
+                "read_center_windows",
+                run_id=run_id, window_size=args.window_size,
+                crs=str(crs),
+            )
 
-    out_water_tif = os.path.join(args.outdir, "water_mask_t1.tif")
-    out_ratio_tif = os.path.join(args.outdir, "ratio_db_t1_minus_t0.tif")
-    out_change_tif = os.path.join(args.outdir, "change_mask_ratio_db.tif")
+            # For simplicity, require same transform (center windows may differ slightly if raster dims differ)
+            # If transforms differ, we still proceed using t1 transform for outputs, assuming same pixel grid
+            transform = transform1
 
-    # out_gpkg = os.path.join(args.outdir, "sar101_masks.gpkg")
+        # Convert to dB
+        db0 = to_db(arr0)
+        db1 = to_db(arr1)
 
-    # Quicklooks (auto vmin/vmax to see contrast; tweak if you want consistent scaling)
-    save_quicklook_png(out_db1_png, db1, title=f"S1 RTC {t1.asset_key.upper()} backscatter (dB) t1")
-    save_quicklook_png(out_ratio_png, ratio_db, title="Change detection ratio_db = db(t1) - db(t0)")
+        # Change detection ratio in dB (equivalent to 10log10(arr1/arr0))
+        ratio_db = db1 - db0
 
-    # Write rasters
-    write_geotiff(out_water_tif, water_mask_t1, transform, crs, dtype="uint8", nodata=0)
-    write_geotiff(out_change_tif, change_mask, transform, crs, dtype="uint8", nodata=0)
-    write_geotiff(out_ratio_tif, ratio_db.astype("float32"), transform, crs, dtype="float32", nodata=np.nan)
+        # Masks
+        water_mask_t1 = (db1 < args.water_thr_db).astype("uint8")
+        change_mask = (np.abs(ratio_db) > args.change_thr_db).astype("uint8")
 
-    # # Polygonize to GeoPackage (two layers)
-    # if os.path.exists(out_gpkg):
-    #     os.remove(out_gpkg)
-    # polygonize_mask_to_gpkg(out_gpkg, "water_polys_t1", water_mask_t1, transform, crs, keep_value=1)
-    # polygonize_mask_to_gpkg(out_gpkg, "change_polys_ratio_db", change_mask, transform, crs, keep_value=1)
 
-    out_gpkg_water = os.path.join(args.outdir, "water_polys_t1.gpkg")
-    out_gpkg_change = os.path.join(args.outdir, "change_polys_ratio_db.gpkg")
+        audit(
+            "masks_computed",
+            run_id=run_id, water_thr_db=args.water_thr_db,
+            change_thr_db=args.change_thr_db,
+            water_pct=float(water_mask_t1.mean() * 100.0),
+            change_pct=float(change_mask.mean() * 100.0),
+        )
+        # Output paths
+        out_db1_png = os.path.join(args.outdir, "quicklook_t1_backscatter_db.png")
+        out_ratio_png = os.path.join(args.outdir, "quicklook_ratio_db_t1_minus_t0.png")
 
-    polygonize_mask_to_gpkg(out_gpkg_water, "water_polys_t1", water_mask_t1, transform, crs, keep_value=1)
-    polygonize_mask_to_gpkg(out_gpkg_change, "change_polys_ratio_db", change_mask, transform, crs, keep_value=1)
+        out_water_tif = os.path.join(args.outdir, "water_mask_t1.tif")
+        out_ratio_tif = os.path.join(args.outdir, "ratio_db_t1_minus_t0.tif")
+        out_change_tif = os.path.join(args.outdir, "change_mask_ratio_db.tif")
 
-    print("\nWrote outputs:")
-    print(f"  {out_db1_png}")
-    print(f"  {out_ratio_png}")
-    print(f"  {out_water_tif}")
-    print(f"  {out_ratio_tif}")
-    print(f"  {out_change_tif}")
-    print(f"  {out_gpkg_water}")
-    print(f"  {out_gpkg_change}")
+        # out_gpkg = os.path.join(args.outdir, "sar101_masks.gpkg")
 
-    print("\nTips:")
-    print("  - Open outputs/*.gpkg in QGIS.")
-    print("  - The thresholds are rough; tune --water-thr-db and --change-thr-db for your AOI/time period.")
+        # Quicklooks (auto vmin/vmax to see contrast; tweak if you want consistent scaling)
+        save_quicklook_png(out_db1_png, db1, title=f"S1 RTC {t1.asset_key.upper()} backscatter (dB) t1")
+        save_quicklook_png(out_ratio_png, ratio_db, title="Change detection ratio_db = db(t1) - db(t0)")
+
+        # Write rasters
+        write_geotiff(out_water_tif, water_mask_t1, transform, crs, dtype="uint8", nodata=0)
+        write_geotiff(out_change_tif, change_mask, transform, crs, dtype="uint8", nodata=0)
+        write_geotiff(out_ratio_tif, ratio_db.astype("float32"), transform, crs, dtype="float32", nodata=np.nan)
+
+        # # Polygonize to GeoPackage (two layers)
+        # if os.path.exists(out_gpkg):
+        #     os.remove(out_gpkg)
+        # polygonize_mask_to_gpkg(out_gpkg, "water_polys_t1", water_mask_t1, transform, crs, keep_value=1)
+        # polygonize_mask_to_gpkg(out_gpkg, "change_polys_ratio_db", change_mask, transform, crs, keep_value=1)
+
+        out_gpkg_water = os.path.join(args.outdir, "water_polys_t1.gpkg")
+        out_gpkg_change = os.path.join(args.outdir, "change_polys_ratio_db.gpkg")
+
+        audit(
+            "output_paths_resolved",
+            run_id=run_id, quicklook_t1=out_db1_png,
+            quicklook_ratio=out_ratio_png,
+            water_mask_tif=out_water_tif,
+            ratio_tif=out_ratio_tif,
+            change_mask_tif=out_change_tif,
+            water_gpkg=out_gpkg_water,
+            change_gpkg=out_gpkg_change,
+        )
+
+        polygonize_mask_to_gpkg(out_gpkg_water, "water_polys_t1", water_mask_t1, transform, crs, keep_value=1)
+        polygonize_mask_to_gpkg(out_gpkg_change, "change_polys_ratio_db", change_mask, transform, crs, keep_value=1)
+
+
+        audit(
+            "outputs_written",
+            run_id=run_id, quicklook_t1=out_db1_png,
+            quicklook_ratio=out_ratio_png,
+            water_mask_tif=out_water_tif,
+            ratio_tif=out_ratio_tif,
+            change_mask_tif=out_change_tif,
+            water_gpkg=out_gpkg_water,
+            change_gpkg=out_gpkg_change,
+        )
+        print("\nWrote outputs:")
+        print(f"  {out_db1_png}")
+        print(f"  {out_ratio_png}")
+        print(f"  {out_water_tif}")
+        print(f"  {out_ratio_tif}")
+        print(f"  {out_change_tif}")
+        print(f"  {out_gpkg_water}")
+        print(f"  {out_gpkg_change}")
+
+        print("\nTips:")
+        print("  - Open outputs/*.gpkg in QGIS.")
+        print("  - The thresholds are rough; tune --water-thr-db and --change-thr-db for your AOI/time period.")
+    except Exception as e:
+        audit("run_failed", run_id=run_id, error=str(e), error_type=type(e).__name__)
+        raise
+    else:
+        audit("run_completed")
 
 
 if __name__ == "__main__":
