@@ -116,6 +116,9 @@ From the repo root:
 
 ```sh
 python src/sar101.py
+python src/sar101.py --prefer-polarization vv --outdir outputs_vv
+python src/sar101.py --prefer-polarization vh --outdir outputs_vh
+
 ```
 
         Common overrides (these match **sar101.py** CLI flags exactly):
