@@ -1,5 +1,7 @@
 # sar101 — SAR mini‑lab (Sentinel‑1 RTC) with Python (STAC‑native, rasterio)
 
+![Sentinel-1 RTC backscatter (t1, dB)](docs/images/quicklook_t1_backscatter_db.png)
+
 This repository is a **hands‑on Synthetic Aperture Radar (SAR) mini‑lab** that:
 
 1. Queries **recent Sentinel‑1 Radiometrically Terrain Corrected (RTC)** scenes via a **STAC API** (Microsoft Planetary Computer)
@@ -35,7 +37,7 @@ sar101/
 
 ---
 
-## What you’ll get (outputs)
+## Outputs
 
 After running the lab you should see:
 
@@ -63,9 +65,12 @@ Override with `--bbox`.
 
 ---
 
-# 1) Setup (macOS, no conda)
+# 1) Setup
 
-This project intentionally **does not use conda**.
+This setup mirrors **modern operational SAR analytics pipelines**:
+STAC → COG streaming → rasterio → vectorization → GeoServer.
+
+This project is developed on macOS and does not use `conda`.
 
 ### Create a virtual environment
 
@@ -100,6 +105,8 @@ If access issues occur, set:
 ```sh
 export PC_SAS_TOKEN="YOUR_TOKEN"
 ```
+
+Or use `source .env`, see `sample.env`.
 
 ---
 
@@ -282,7 +289,9 @@ ogr2ogr -f "PostgreSQL"   PG:"host=localhost port=5432 dbname=gis user=gis passw
   - change: `--change-thr-db`
 - VV vs VH behaves differently; VV is preferred
 
-### Known macOS Fiona caveat (GeoPackage append)
+### Known caveats
+
+#### macOS Fiona GeoPackage append
 
 On some macOS Python environments (depending on how `fiona`/`gdal` binaries are resolved),
 **appending multiple layers to a single GeoPackage** can fail with a *NULL pointer error*.
@@ -299,8 +308,3 @@ once your local stack is known-good.
 ### Performance
 Only a centered window is processed (default 1024×1024).  
 Increase `--window-size` if needed.
-
----
-
-This setup mirrors **modern operational SAR analytics pipelines**:
-STAC → COG streaming → rasterio → vectorization → GeoServer.
