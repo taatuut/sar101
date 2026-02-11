@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import math
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -31,6 +32,7 @@ import matplotlib.pyplot as plt
 import rasterio
 from rasterio.windows import Window
 from rasterio.features import shapes
+from rasterio.warp import transform as rio_transform
 
 import fiona
 from fiona.crs import to_string as crs_to_string
@@ -47,7 +49,32 @@ import getpass
 import time
 
 import uuid
-from audit_log.log import log as audit_log
+
+# Optional dependency: iceye-audit-log (https://github.com/iceye-ltd/python-audit-log)
+try:
+    import audit_log.log as _iceye_audit_mod  # type: ignore
+    from audit_log.log import log as _iceye_audit_log  # type: ignore
+except Exception:  # pragma: no cover
+    _iceye_audit_mod = None
+    _iceye_audit_log = None
+
+
+@dataclass
+class PrincipalCompat:
+    """Dataclass-compatible principal for iceye-audit-log.
+
+    `iceye-audit-log` serializes the given principal using `dataclasses.asdict()`.
+    If we pass a plain dict, it crashes with:
+      TypeError: asdict() should be called on dataclass instances
+
+    This small compatibility wrapper keeps sar101.py usable both with and without
+    the external audit log dependency.
+    """
+
+    user: Optional[str] = None
+    host: Optional[str] = None
+    ip: Optional[str] = None
+    extra: Optional[Dict[str, Any]] = None
 
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
@@ -56,8 +83,93 @@ STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 # Breda AOI (lon/lat bbox): [minLon, minLat, maxLon, maxLat]
 DEFAULT_BBOX_BREDA = [4.70, 51.53, 4.90, 51.66]
 
+# Nijmegen AOI (Brakkenstein area) (lon/lat bbox): [minLon, minLat, maxLon, maxLat]
+DEFAULT_BBOX_NIJMEGEN_BRAKKENSTEIN = [5.845, 51.812, 5.885, 51.835]
+
+# Port of Rotterdam AOI (incl. Europoort/Maasvlakte-ish) (lon/lat bbox): [minLon, minLat, maxLon, maxLat]
+DEFAULT_BBOX_PORT_OF_ROTTERDAM = [3.98, 51.86, 4.55, 52.03]
+
+DEFAULT_BBOX = DEFAULT_BBOX_NIJMEGEN_BRAKKENSTEIN
 
 
+def _bbox_center(b: List[float]) -> Tuple[float, float]:
+    """(lon, lat) center of a lon/lat bbox."""
+    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+
+def _haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Great-circle distance (km) using a simple haversine."""
+    r = 6371.0088
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r * c
+
+
+def log_stac_search_diagnostics(
+    *,
+    logger: logging.Logger,
+    collection: str,
+    bbox: List[float],
+    start: datetime,
+    end: datetime,
+    items: List[Any],
+    top_n: int = 10,
+) -> None:
+    """Log basic sanity checks: input bbox vs returned item footprints/bboxes."""
+    in_lon, in_lat = _bbox_center(bbox)
+    logger.info(
+        "STAC search diagnostics: collection=%s bbox=%s center=(%.6f,%.6f) datetime=%s/%s items=%d",
+        collection,
+        bbox,
+        in_lon,
+        in_lat,
+        start.isoformat(),
+        end.isoformat(),
+        len(items),
+    )
+
+    # Sort newest first for easier eyeballing
+    def _item_dt(it) -> datetime:
+        dt = it.properties.get("datetime")
+        if isinstance(dt, str):
+            return datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        return dt
+
+    items_sorted = sorted(items, key=_item_dt, reverse=True)
+
+    for it in items_sorted[:top_n]:
+        ib = getattr(it, "bbox", None)
+        geom = getattr(it, "geometry", None)
+        dt = _item_dt(it)
+
+        # Item bbox center if bbox present
+        if ib and len(ib) == 4:
+            i_lon, i_lat = _bbox_center(list(ib))
+            dist_km = _haversine_km(in_lon, in_lat, i_lon, i_lat)
+        else:
+            i_lon = i_lat = float("nan")
+            dist_km = float("nan")
+
+        logger.info(
+            "STAC item: id=%s dt=%s item_bbox=%s item_bbox_center=(%.6f,%.6f) center_dist_km=%.1f has_geometry=%s",
+            it.id,
+            dt.isoformat(),
+            ib,
+            i_lon,
+            i_lat,
+            dist_km,
+            bool(geom),
+        )
+
+    # Extra hint: this script reads the *scene center* unless you change the windowing.
+    logger.info(
+        "NOTE: SAR101 currently reads a center window of the *full raster scene*. "
+        "If a returned item covers a large swath, the center window may be far from your input bbox."
+    )
 
 def repo_root() -> Path:
     """Repo root assumed to be the parent of the `src/` directory."""
@@ -89,6 +201,16 @@ def setup_file_logging() -> Path:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
+    # Also log to console for quick debugging (once).
+    if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+        sh = logging.StreamHandler()
+        sh.setLevel(logging.INFO)
+        sh.setFormatter(logging.Formatter(
+            fmt="%(asctime)sZ %(levelname)s %(name)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        ))
+        root_logger.addHandler(sh)
+
     # Avoid duplicate handlers on repeated runs (e.g., notebooks)
     if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith(str(log_path))
                for h in root_logger.handlers):
@@ -112,22 +234,50 @@ def setup_file_logging() -> Path:
 def audit(event: str, **fields) -> None:
     """
     Write an audit event to:
-      1) local rotating file log (JSON line)
-      2) ICEYE audit_log.log.log()
+      1) local rotating file log (JSON line) via stdlib logging
+      2) (optional) ICEYE iceye-audit-log (https://github.com/iceye-ltd/python-audit-log)
 
-    The ICEYE library currently requires:
-      action, resource_type, resource_id, result, principal
-    (see TypeError in logs if omitted).
+    Notes about iceye-audit-log:
+    - Its public API is `from audit_log.log import log`.
+    - The function signature is positional-first and differs from earlier experiments.
+      Current releases (e.g. 0.2.x) expect at least:
+        log(event, resource_type, resource_id, result, principal, ...)
+      and will try to pull `request_id` from a ContextVar if not provided.
 
-    This wrapper guarantees those fields and never breaks the SAR pipeline
-    if the audit library call fails.
+    This wrapper always logs locally and then best-effort calls iceye-audit-log
+    **without ever breaking** the SAR101 pipeline.
     """
-    # Local JSON line (always)
+
+    # --- 1) Always log locally as JSON ---
     payload = {"event": event, **fields}
     logging.getLogger("sar101.audit").info(json.dumps(payload, default=str))
 
-    # Required fields for iceye-audit-log
-    principal = fields.get("principal") or getpass.getuser()
+    # --- 2) Optional call into iceye-audit-log ---
+    if _iceye_audit_log is None:
+        return
+
+    # Required/standard fields
+    # iceye-audit-log expects `principal` to be a *dataclass instance* because it
+    # calls `dataclasses.asdict(principal)` internally.
+    raw_principal = fields.get("principal")
+    if raw_principal is None:
+        raw_principal = {
+            "user": getpass.getuser(),
+            "host": socket.gethostname(),
+        }
+
+    if is_dataclass(raw_principal) and not isinstance(raw_principal, type):
+        principal = raw_principal
+    elif isinstance(raw_principal, dict):
+        principal = PrincipalCompat(
+            user=raw_principal.get("user") or raw_principal.get("username") or raw_principal.get("name"),
+            host=raw_principal.get("host") or socket.gethostname(),
+            ip=raw_principal.get("ip"),
+            extra={k: v for k, v in raw_principal.items() if k not in {"user", "username", "name", "host", "ip"}},
+        )
+    else:
+        # treat as a simple identifier (e.g., username string)
+        principal = PrincipalCompat(user=str(raw_principal), host=socket.gethostname())
     resource_type = fields.get("resource_type") or "sar101"
     resource_id = (
         fields.get("resource_id")
@@ -140,60 +290,60 @@ def audit(event: str, **fields) -> None:
     if result is None:
         result = "FAILURE" if event in ("run_failed",) or event.endswith("_failed") else "SUCCESS"
 
-    # Optional details/context for audit systems that support it
+    # IMPORTANT: avoid ContextVar LookupError in iceye-audit-log by always providing request_id.
+    request_id = str(fields.get("run_id") or uuid.uuid4())
+
+    # Add all context as details (if supported by the lib)
     details = dict(fields)
     details.setdefault("event", event)
 
     try:
-        # Prefer keyword call (clear), fall back to positional if needed.
-        try:
-            audit_log(
+        # If module exposes REQ_ID ContextVar, set it too (belt-and-suspenders).
+        if _iceye_audit_mod is not None and hasattr(_iceye_audit_mod, "REQ_ID"):
+            try:
+                _iceye_audit_mod.REQ_ID.set(request_id)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        import inspect
+
+        sig = inspect.signature(_iceye_audit_log)
+        params = sig.parameters
+
+        # Build kwargs only for supported optional params
+        opt_kwargs = {}
+        if "request_id" in params:
+            opt_kwargs["request_id"] = request_id
+        if "details" in params:
+            opt_kwargs["details"] = details
+        # Some versions may accept "reason"; pass through if user provided.
+        if "reason" in params and "reason" in fields:
+            opt_kwargs["reason"] = fields["reason"]
+
+        # Prefer keyword names if present; otherwise call positionally.
+        if "action" in params:
+            # (older/alternate API)
+            _iceye_audit_log(
                 action=event,
                 resource_type=resource_type,
                 resource_id=resource_id,
                 result=result,
                 principal=principal,
-                details=details,
+                **opt_kwargs,
             )
-        except TypeError:
-            # Some versions may not accept 'details' or keyword 'action'
-            try:
-                audit_log(
-                    action=event,
-                    resource_type=resource_type,
-                    resource_id=resource_id,
-                    result=result,
-                    principal=principal,
-                )
-            except TypeError:
-                # Positional fallback: (action, resource_type, resource_id, result, principal)
-                audit_log(event, resource_type, resource_id, result, principal)
-    except Exception:
-        logging.getLogger("sar101.audit").exception("iceye-audit-log call failed")
-
-
-    # Call iceye-audit-log best-effort without ever breaking the pipeline
-    try:
-        sig = inspect.signature(audit_log)
-        params = sig.parameters
-
-        # If it supports **kwargs, pass everything
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            audit_log(event=event, **fields)
-            return
-
-        allowed = {k: v for k, v in fields.items() if k in params}
-        if "event" in params:
-            allowed["event"] = event
-
-        positional = [
-            p for p in params.values()
-            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        if positional and "event" not in params and positional[0].name not in allowed:
-            audit_log(event, **allowed)  # type: ignore
+        elif "event" in params:
+            _iceye_audit_log(
+                event=event,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                result=result,
+                principal=principal,
+                **opt_kwargs,
+            )
         else:
-            audit_log(**allowed)         # type: ignore
+            # Current API (0.2.x): positional required args
+            _iceye_audit_log(event, resource_type, resource_id, result, principal, **opt_kwargs)
+
     except Exception:
         logging.getLogger("sar101.audit").exception("iceye-audit-log call failed")
 
@@ -207,7 +357,7 @@ class Scene:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SAR101: Sentinel-1 RTC STAC streaming + masks + change detection")
-    p.add_argument("--bbox", type=float, nargs=4, default=DEFAULT_BBOX_BREDA,
+    p.add_argument("--bbox", type=float, nargs=4, default=DEFAULT_BBOX,
                    metavar=("MINLON", "MINLAT", "MAXLON", "MAXLAT"),
                    help="AOI bounding box in lon/lat (EPSG:4326). Default is around Breda.")
     p.add_argument("--days", type=int, default=30, help="Look back window in days (default: 30).")
@@ -250,6 +400,24 @@ def stac_search_two_most_recent(
         limit=limit,
     )
     items = list(search.items())
+
+    # Diagnostics: show what we asked for vs what came back.
+    # This is especially useful if you *think* you're landing in the wrong place.
+    # NOTE: later in the pipeline we read the *scene center window* (not an AOI window),
+    # so it is totally possible to query Nijmegen and then visualize something that looks like
+    # Harderwijk (center of the returned scene). This log makes that obvious.
+    try:
+        log_stac_search_diagnostics(
+            logger=logging.getLogger("sar101.stac"),
+            collection=collection,
+            bbox=bbox,
+            start=start,
+            end=end,
+            items=items,
+            top_n=min(10, len(items)),
+        )
+    except Exception:
+        logging.getLogger("sar101.stac").exception("Failed to log STAC search diagnostics")
     if len(items) < 2:
         raise RuntimeError(
             f"Need at least 2 scenes, found {len(items)}. Try increasing --days or expanding --bbox."
@@ -330,6 +498,81 @@ def read_center_window(ds: rasterio.io.DatasetReader, size: int) -> Tuple[np.nda
     window = Window(col_off=col_off, row_off=row_off, width=size, height=size)
     arr = ds.read(1, window=window).astype("float32")
     transform = ds.window_transform(window)
+    return arr, transform
+
+
+def read_aoi_center_window(
+    ds: rasterio.io.DatasetReader,
+    size: int,
+    bbox_lonlat: List[float],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[np.ndarray, rasterio.Affine]:
+    """Read a square window centered on the *AOI bbox center*.
+
+    - bbox_lonlat is expected in EPSG:4326 lon/lat.
+    - The AOI center is reprojected into the dataset CRS before indexing.
+
+    This is the high-impact fix that ensures the extracted chip actually corresponds
+    to your intended AOI (instead of the scene center).
+    """
+    if logger is None:
+        logger = logging.getLogger("sar101.window")
+
+    # AOI center in lon/lat
+    aoi_lon, aoi_lat = _bbox_center(bbox_lonlat)
+
+    # Reproject AOI center into dataset CRS (x/y)
+    if ds.crs is None:
+        raise RuntimeError("Dataset has no CRS; cannot place AOI window.")
+
+    if str(ds.crs).upper() in ("EPSG:4326", "WGS84"):
+        x, y = aoi_lon, aoi_lat
+    else:
+        xs, ys = rio_transform("EPSG:4326", ds.crs, [aoi_lon], [aoi_lat])
+        x, y = xs[0], ys[0]
+
+    # Convert to raster indices
+    row, col = ds.index(x, y)
+
+    w = ds.width
+    h = ds.height
+    half = size // 2
+
+    col_off = int(col - half)
+    row_off = int(row - half)
+
+    # Clamp offsets within raster bounds
+    col_off = max(0, min(col_off, max(0, w - size)))
+    row_off = max(0, min(row_off, max(0, h - size)))
+
+    window = Window(col_off=col_off, row_off=row_off, width=size, height=size)
+    arr = ds.read(1, window=window).astype("float32")
+    transform = ds.window_transform(window)
+
+    # Helpful diagnostics for "why am I seeing Harderwijk" moments.
+    try:
+        left, bottom, right, top = rasterio.windows.bounds(window, ds.transform)
+        logger.info(
+            "AOI-center window: aoi_center_lonlat=(%.6f,%.6f) ds_crs=%s aoi_center_xy=(%.3f,%.3f) "
+            "rowcol=(%d,%d) window_off=(%d,%d) window_bounds_in_ds_crs=(%.3f,%.3f,%.3f,%.3f)",
+            aoi_lon,
+            aoi_lat,
+            str(ds.crs),
+            x,
+            y,
+            row,
+            col,
+            col_off,
+            row_off,
+            left,
+            bottom,
+            right,
+            top,
+        )
+    except Exception:
+        logger.exception("Failed to compute/log AOI window diagnostics")
+
     return arr, transform
 
 
@@ -456,14 +699,17 @@ def main() -> None:
                 raise RuntimeError(f"CRS mismatch: t0={ds0.crs} t1={ds1.crs}. Use a preprocessing step to align.")
             crs = ds0.crs
 
-            # Read same-size center window from each
-            arr0, transform0 = read_center_window(ds0, args.window_size)
-            arr1, transform1 = read_center_window(ds1, args.window_size)
+            # Read same-size window centered on the *AOI bbox center* (reprojected to dataset CRS)
+            arr0, transform0 = read_aoi_center_window(ds0, args.window_size, bbox)
+            arr1, transform1 = read_aoi_center_window(ds1, args.window_size, bbox)
 
             audit(
-                "read_center_windows",
-                run_id=run_id, window_size=args.window_size,
+                "read_aoi_center_windows",
+                run_id=run_id,
+                window_size=args.window_size,
                 crs=str(crs),
+                aoi_bbox_lonlat=bbox,
+                aoi_center_lonlat=_bbox_center(bbox),
             )
 
             # For simplicity, require same transform (center windows may differ slightly if raster dims differ)
