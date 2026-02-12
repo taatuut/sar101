@@ -1,6 +1,7 @@
 services:
   postgis:
-    image: postgis/postgis:16-3.4
+    image: imresamu/postgis
+    platform: linux/arm64
     container_name: sar101-postgis
     environment:
       POSTGRES_DB: gis
@@ -8,14 +9,15 @@ services:
       POSTGRES_PASSWORD: gis
     ports:
       - "5432:5432"
-    volumes:
-      - postgis_data:/var/lib/postgresql/data
+    # volumes:
+    #   - postgis_data:/var/lib/postgresql
+    # todo: check how to get volumes working on arm64
 
   geoserver:
     image: kartoza/geoserver:2.25.2
     container_name: sar101-geoserver
-    depends_on:
-      - postgis
+    # depends_on:
+    #   - postgis
     environment:
       GEOSERVER_ADMIN_USER: admin
       GEOSERVER_ADMIN_PASSWORD: geoserver

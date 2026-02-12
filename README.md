@@ -280,6 +280,81 @@ ogr2ogr -f "PostgreSQL"   PG:"host=localhost port=5432 dbname=gis user=gis passw
    - `change_polys_ratio_db`
 7. Use **Layer Preview → OpenLayers**
 
+```sh
+curl -u admin:geoserver -XPOST \
+  -H "Content-type: text/xml" \
+  -d "<workspace><name>sar101</name></workspace>" \
+  "http://localhost:8080/geoserver/rest/workspaces"
+
+curl -u admin:geoserver -XPOST \
+  -H "Content-type: text/xml" \
+  -d '
+<dataStore>
+  <name>gis_postgis</name>
+  <connectionParameters>
+    <host>postgis</host>
+    <port>5432</port>
+    <database>gis</database>
+    <user>gis</user>
+    <passwd>gis</passwd>
+    <dbtype>postgis</dbtype>
+  </connectionParameters>
+</dataStore>' \
+  "http://localhost:8080/geoserver/rest/workspaces/sar101/datastores"
+
+curl -u admin:geoserver -XPOST \
+  -H "Content-type: text/xml" \
+  -d "<featureType><name>water_polys_t1</name></featureType>" \
+  "http://localhost:8080/geoserver/rest/workspaces/sar101/datastores/gis_postgis/featuretypes"
+
+curl -u admin:geoserver -XPOST \
+  -H "Content-type: text/xml" \
+  -d "<featureType><name>change_polys_ratio_db</name></featureType>" \
+  "http://localhost:8080/geoserver/rest/workspaces/sar101/datastores/gis_postgis/featuretypes"
+
+curl -s "http://localhost:8080/geoserver/sar101/wms?service=WMS&version=1.1.0&request=GetCapabilities"
+
+GS="http://localhost:8080/geoserver"
+AUTH="admin:geoserver"
+WS="sar101"
+STORE="gis_postgis"
+LAYER="water_polys_t1"
+SRS="EPSG:4326"
+
+curl -u "$AUTH" -XPUT \
+  -H "Content-Type: text/xml" \
+  -d "<featureType><name>$LAYER</name><srs>$SRS</srs><enabled>true</enabled></featureType>" \
+  "$GS/rest/workspaces/$WS/datastores/$STORE/featuretypes/$LAYER?recalculate=nativebbox,latlonbbox"
+
+# todo: same for change_polys_ratio_db.
+
+LAYER="water_polys_t1"
+
+curl -u "$AUTH" -XPUT \
+  -H "Content-Type: text/xml" \
+  -d "<layer><enabled>true</enabled><advertised>true</advertised></layer>" \
+  "$GS/rest/layers/$WS:$LAYER"
+
+STYLE="water_polys"
+
+curl -u "$AUTH" -XPOST \
+  -H "Content-Type: application/vnd.ogc.sld+xml" \
+  --data-binary @styles/water_polys.sld \
+  "$GS/rest/workspaces/$WS/styles?name=$STYLE"
+
+LAYER="water_polys_t1"
+STYLE="water_polys"
+
+curl -u "$AUTH" -XPUT \
+  -H "Content-Type: text/xml" \
+  -d "<layer><defaultStyle><name>$STYLE</name></defaultStyle></layer>" \
+  "$GS/rest/layers/$WS:$LAYER"
+
+# layer does not display fix check epsg
+
+```
+
+See 
 ---
 
 # 5) Notes & troubleshooting
