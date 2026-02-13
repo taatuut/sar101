@@ -350,9 +350,9 @@ curl -u "$AUTH" -XPUT \
 
 # layer does not display fix check epsg
 
-![GeoServer Layer Preview](docs/images/geoserver.png)
-
 ```
+
+![GeoServer Layer Preview](docs/images/geoserver.png)
 
 # Notes & troubleshooting
 
