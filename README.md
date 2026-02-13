@@ -14,8 +14,8 @@ This repository is a **hands‑on Synthetic Aperture Radar (SAR) mini‑lab** th
    - GeoTIFF rasters
    - a GeoPackage with polygonized masks
 
-> The masks and change detection are intentionally simple heuristics.  
-> They are meant for **learning and experimentation**, not production flood or damage mapping.
+> The masks and change detection are intentionally simple heuristics for **learning and experimentation**,
+> not geared towards production flood or damage mapping.
 
 ---
 
@@ -55,17 +55,17 @@ After running the lab you should see:
 
 ## Area of interest (AOI)
 
-Default AOI is **around Breda, NL** (lon/lat bbox):
+Default AOI is **around Nijmegen, NL** (lon/lat bbox):
 
 ```
-[minLon, minLat, maxLon, maxLat] = [4.70, 51.53, 4.90, 51.66]
+[minLon, minLat, maxLon, maxLat] = [5.845, 51.812, 5.885, 51.835]
 ```
 
 Override with `--bbox`.
 
 ---
 
-# 1) Setup
+# Setup
 
 This setup mirrors **modern operational SAR analytics pipelines**:
 STAC → COG streaming → rasterio → vectorization → GeoServer.
@@ -110,7 +110,7 @@ Or use `source .env`, see `sample.env`.
 
 ---
 
-# 2) Run the mini‑lab
+# Run the mini‑lab
 
 From the repo root:
 
@@ -152,7 +152,7 @@ Help:
 python src/sar101.py --help
 ```
 
-## CLI flags (sar101.py)
+## CLI flags for sar101.py
 
 ```text
 --bbox MINLON MINLAT MAXLON MAXLAT   AOI bounding box in lon/lat (EPSG:4326)
@@ -187,7 +187,7 @@ This highlights areas with strong backscatter increase or decrease between acqui
 
 ---
 
-# 3) View results
+# View results
 
 ## A) In QGIS
 
@@ -224,9 +224,7 @@ Then:
 1. Open https://geojson.io
 2. Drag‑and‑drop the `.geojson` file
 
----
-
-# 4) Serve results via GeoServer (Docker)
+# Serve results via GeoServer (Docker)
 
 GeoServer works most reliably with **PostGIS** as a data store.
 
@@ -354,10 +352,7 @@ curl -u "$AUTH" -XPUT \
 
 ```
 
-See 
----
-
-# 5) Notes & troubleshooting
+# Notes & troubleshooting
 
 ### No scenes found
 - Increase `--days`
@@ -384,7 +379,6 @@ To keep the lab stable and reproducible, the pipeline writes **two separate GeoP
 
 This is an implementation detail, not a conceptual limitation: you can merge layers later using `ogr2ogr`
 once your local stack is known-good.
-
 
 ### Performance
 Only a centered window is processed (default 1024×1024).  
