@@ -305,8 +305,6 @@ def audit(event: str, **fields) -> None:
             except Exception:
                 pass
 
-        import inspect
-
         sig = inspect.signature(_iceye_audit_log)
         params = sig.parameters
 
