@@ -22,17 +22,37 @@ This repository is a **hands‑on Synthetic Aperture Radar (SAR) mini‑lab** th
 ## Folder structure
 
 ```
-sar101/
-  src/
-    sar101.py                # main pipeline (rasterio, STAC-native)
-  outputs/                   # generated artifacts (gitignored)
-  docker/
-    geoserver/
-      docker-compose.yml
-      geoserver_data/        # created at runtime
-  requirements.txt
-  .gitignore
-  README.md
+├── README.md
+├── clean.sh
+├── docker
+│   └── geoserver
+│       └── docker-compose.yml
+├── docs
+│   ├── images
+│   │   ├── geoserver.png
+│   │   ├── qgis.png
+│   │   ├── quicklook_t1_backscatter_db.png
+│   │   └── sar101_architecture.png
+│   └── uml
+│       └── sar101_architecture.puml
+├── environment.yml
+├── logs
+├── notebooks
+│   ├── 01_explore_backscatter.ipynb
+│   ├── 02_water_vs_land.ipynb
+│   ├── 03_change_detection_explained.ipynb
+│   └── README.md
+├── outputs
+├── qgis
+│   └── Nijmegen.qgz
+├── requirements.txt
+├── sample.env
+├── src
+│   ├── publish2geoserver.py
+│   └── sar101.py
+├── styles
+│   └── water_polys.sld
+└── tree.txt
 ```
 
 ---

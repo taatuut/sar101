@@ -175,3 +175,4 @@ cython_debug/
 **/Thumbs.db
 *.zip
 outputs/**
+tree.txt
